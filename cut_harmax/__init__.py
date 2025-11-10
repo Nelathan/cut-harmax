@@ -3,10 +3,14 @@ from cut_harmax.harmax import (
     HarMaxFunction,
     cut_harmax_loss,
 )
+from cut_harmax.harmax_sampling_inference import (
+    harmax_sample,
+)
 
 __all__ = [
     "HarMaxFunction",
     "cut_harmax_loss",
+    "harmax_sample",
 ]
 
 

@@ -115,7 +115,6 @@ def harmax_apply(
     return loss
 
 
-@add_doc_start(LINEAR_CROSS_ENTROPY_DOC)
 def cut_harmax_loss(
     e: torch.Tensor,
     c: torch.Tensor,

@@ -1,12 +1,12 @@
-# HarMax Loss Implementation - Cut HarMax
+# Cut HarMax: Memory-efficient Harmonic Loss Implementation
 
 ## Overview
 
-This implementation adapts the "Cut" technique (originally developed for Cross-Entropy loss) to compute the **Harmonic Loss** efficiently using **HarMax** normalization. The new **"Cut HarMax"** kernels compute the exact, full-vocabulary harmonic loss without materializing the (batch_size, vocab_size) distance matrix.
+This implementation adapts the "Cut" technique from CCE to compute the Harmonic Loss efficiently. The new "Cut HarMax" kernels compute the exact, full-vocabulary harmonic loss without materializing the (batch_size, vocab_size) distance matrix, just as CCE does for the logit matrix.
 
 ## Project Structure
 
-The implementation follows the same naming principle as the original CCE (Cut Cross-Entropy):
+The implementation follows the same naming principle as the original CCE:
 
 - **CCE** = Cut Cross-Entropy
 - **HarMax** = Cut HarMax (Harmonic Loss with HarMax normalization)
@@ -14,17 +14,17 @@ The implementation follows the same naming principle as the original CCE (Cut Cr
 ```
 cut_cross_entropy/     # Original Cross-Entropy implementation
 cut_harmax/           # New HarMax implementation
-├── harmax.py                    # Main API and autograd function
-├── harmax_lse_forward.py        # Forward kernel (log-sum-reciprocal)
-├── harmax_backward.py           # Backward kernel (harmonic gradients)
-├── indexed_distance.py          # Target token distance extraction
-├── constants.py                 # Constants (IGNORE_INDEX)
-├── utils.py                     # Utility functions
-├── tl_autotune.py               # Triton autotuning
-├── tl_utils.py                  # Triton utilities
-├── doc.py                       # Documentation utilities
-└── tests/                       # Test suite
-    └── test_harmonic_loss_forward.py
+├── harmax.py                 # Main API and autograd function
+├── harmax_lse_forward.py    # Forward kernel (log-sum-reciprocal)
+├── harmax_backward.py       # Backward kernel (harmonic gradients)
+├── indexed_distance.py       # Target token distance extraction
+├── constants.py              # Constants (IGNORE_INDEX)
+├── utils.py                  # Utility functions
+├── tl_autotune.py            # Triton autotuning
+├── tl_utils.py               # Triton utilities
+├── doc.py                    # Documentation utilities
+└── tests/                   # Test suite
+    └── test_harmax_sampling_inference.py
 ```
 
 ## Mathematical Foundation
@@ -63,23 +63,15 @@ cut_harmax/           # New HarMax implementation
 - `cut_harmax_loss`: Public API function
 - `HarMaxParams`: Parameter dataclass for configuration
 - Enforces bfloat16 input requirements
-- Integrates with existing "Cut" infrastructure
 
 ### 2. `harmax_lse_forward.py`
 **Purpose**: Forward kernel for HarMax loss computation
 
 **Key Features:**
-- Fused distance calculation using identity: $L_j = ||v||^2 + ||w_j||^2 - 2(v \cdot w_j)$
+- Fused distance calculation using identity: $L_j = ||v||^2 + ||w_j||^2 - 2(v·w_j)$
 - Pre-computes `||v||^2` per batch and `||w_j||^2` per vocabulary
 - Stable computation using minimum distance (instead of maximum logits)
 - Epsilon (1e-9) addition to prevent division by zero
-- Float32 accumulators for precision stability
-
-**Stability Trick:**
-```
-S = sum(1/L_j) = (1/L_min) * sum(L_min / L_j)
-log(S) = -log(L_min) + log(sum(L_min / L_j))
-```
 
 ### 3. `harmax_backward.py`
 **Purpose**: Backward kernel for HarMax gradient computation
@@ -90,22 +82,30 @@ log(S) = -log(L_min) + log(sum(L_min / L_j))
   - For incorrect tokens: $\frac{\partial L}{\partial L_j} = \frac{p_j}{L_j}$
   - For correct token: $\frac{\partial L}{\partial L_y} = \frac{1 + p_y}{L_y}$
 - Gradient backpropagation: $\nabla_v L_j = 2 \cdot (v - w_j)$, $\nabla_{w_j} L_j = -2 \cdot (v - w_j)$
-- Major change from CCE: uses `(v - w_j)` instead of `w_j` and `v`
 
 ### 4. `indexed_distance.py`
 **Purpose**: Utility to extract correct token distances
 
 **Key Features:**
 - Computes squared Euclidean distance for target tokens only
-- Analogous to `indexed_neg_dot_forward_kernel` in original CCE
 - Pre-computes norm terms for efficiency
 
+### 5. `harmax_sampling_inference.py`
+**Purpose**: Fast inference sampling with min_p filtering
+
+**Key Features:**
+- `@torch.compile` optimized pure PyTorch implementation
+- Min-p filtering for creative writing quality control
+- Adaptive probability thresholding
+- Full HarMax normalization with quality filtering
+
 ## API Usage
+
+### Training
 
 ```python
 from cut_harmax import cut_harmax_loss
 
-# Basic usage
 loss = cut_harmax_loss(
     e=embeddings,           # (batch_size, embedding_dim) bfloat16
     c=weight_matrix,        # (vocab_size, embedding_dim) bfloat16
@@ -113,15 +113,63 @@ loss = cut_harmax_loss(
     reduction="mean",       # "mean", "sum", or "none"
     shift=False,            # for causal language modeling
 )
+```
 
-# Gradient computation
-embeddings.requires_grad_(True)
-weight_matrix.requires_grad_(True)
+### Inference
 
-loss = cut_harmax_loss(embeddings, weight_matrix, targets)
-loss.backward()
+```python
+from cut_harmax import harmax_sample
 
-# Gradients are available in embeddings.grad and weight_matrix.grad
+tokens = harmax_sample(
+    hidden_states=hidden,     # (batch_size, embed_dim)
+    weight_matrix=weights,      # (vocab_size, embed_dim)
+    temperature=0.8,           # Sampling temperature
+    min_p=0.01                # Minimum probability threshold
+)
+```
+
+## Complete Example
+
+```python
+from cut_harmax import cut_harmax_loss, harmax_sample
+
+class HarMaxModel(nn.Module):
+    def __init__(self, vocab_size, embed_dim):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+        self.transformer = nn.TransformerEncoder(...)
+
+    def forward(self, input_ids, targets=None):
+        hidden = self.embedding(input_ids)
+        hidden = self.transformer(hidden)
+
+        if targets is not None:
+            loss = cut_harmax_loss(
+                e=hidden.view(-1, hidden.size(-1)),
+                c=self.embedding.weight,
+                targets=targets.view(-1)
+            )
+            return hidden, loss
+        return hidden
+
+    def generate(self, prompt, max_tokens=100):
+        self.eval()
+        generated = prompt.clone()
+
+        for _ in range(max_tokens):
+            hidden = self.forward(generated)
+            last_hidden = hidden[:, -1:, :]
+
+            next_token = harmax_sample(
+                hidden_state=last_hidden.squeeze(0),
+                weight_matrix=self.embedding.weight,
+                temperature=0.8,
+                min_p=0.01
+            )
+
+            generated = torch.cat([generated, next_token.unsqueeze(0)], dim=1)
+
+        return generated
 ```
 
 ## Precision and Stability
@@ -140,7 +188,7 @@ loss.backward()
 ### Stability Features
 - **Epsilon**: 1e-9 added to all distance terms before log/reciprocal
 - **Min-based stability**: Uses minimum distance for stable reciprocal computation
-- **Proper masking**: Handles ignore_index and shift parameters correctly
+- **Min-p filtering**: Eliminates tokens below probability threshold
 
 ## Memory Efficiency
 
@@ -152,45 +200,49 @@ The implementation maintains the memory efficiency of the original CCE:
 ## Performance Considerations
 
 - Similar block structure to original CCE for optimal GPU utilization
-- Additional norm computations add minimal overhead
+- torch.compile optimization for inference
+- Min-p filtering for quality control with minimal overhead
 - Float32 accumulators ensure precision without significant performance impact
-- Autotuning through existing Triton autotune infrastructure
 
 ## Installation and Usage
 
 ```bash
-# Install dependencies (requires CUDA and Triton)
 pip install torch triton
 
-# Import and use
-from cut_harmax import cut_harmax_loss
+from cut_harmax import cut_harmax_loss, harmax_sample
 
-# Works exactly like standard PyTorch loss functions
 loss = cut_harmax_loss(embeddings, weights, targets)
-loss.backward()
+token = harmax_sample(hidden_state, weights)
 ```
 
 ## Testing
 
 ### Functional Tests
-- **Location**: `cut_harmax/tests/test_harmonic_loss_forward.py`
-- **Features**: Comparison with manual implementation, gradient verification
-- **Requirements**: CUDA GPU with Triton support
+- **Location**: `cut_harmax/tests/test_harmax_sampling_inference.py`
+- **Features**: Min-p filtering, temperature scaling, batch processing
+- **Requirements**: CUDA GPU with Triton support for training tests
 
 ### API Tests
 - **Location**: `test_harmax_api.py` (root directory)
 - **Features**: API validation, module structure verification
 - **Requirements**: Works without CUDA
 
-### Running Tests
+## Relationship to Original CCE
 
-```bash
-# API tests (always work)
-python test_harmax_api.py
+This implementation demonstrates the power of the "Cut" technique:
+- **Original**: Applied to Cross-Entropy loss → **Cut Cross-Entropy**
+- **New**: Applied to Harmonic loss → **Cut HarMax**
 
-# Kernel tests (require CUDA)
-pytest cut_harmax/tests/
-```
+Both implementations share the same core innovation: avoiding materialization of the full (batch_size, vocab_size) matrix through fused kernel computation and block-wise processing.
+
+## Creative Writing Applications
+
+The HarMax loss is particularly suitable for creative writing applications:
+
+- **Semantic Coherence**: Distance-based relationships focus on meaning
+- **Min-P Filtering**: Eliminates improbable tokens that break immersion
+- **Temperature Control**: Balances dominance vs. diversity
+- **No Averaging**: Avoids hedging toward "safe" predictions
 
 ## Comparison with Manual Implementation
 
@@ -208,7 +260,7 @@ def manual_harmax_loss(e, c, targets):
     target_distances = distances[torch.arange(len(targets)), targets]
 
     # Compute HarMax loss
-    sum_reciprocal = torch.sum(1.0 / distances, dim=1)
+    sum_reciprocal = torch.sum(1.0 / distances, dim=-1)
     loss = torch.log(target_distances) - torch.log(sum_reciprocal)
 
     return loss
@@ -216,20 +268,8 @@ def manual_harmax_loss(e, c, targets):
 
 ## Future Considerations
 
-1. **Performance Optimization**: Further tuning of block sizes for HarMax-specific patterns
-2. **Mixed Precision**: Investigation of other precision schemes if needed
-3. **Adaptive Epsilon**: Dynamic epsilon selection based on input statistics
-4. **Additional Variants**: Support for other distance-based loss functions
-5. **Integration**: Integration with popular ML frameworks
-
-## Relationship to Original CCE
-
-This implementation demonstrates the power of the "Cut" technique:
-- **Original**: Applied to Cross-Entropy loss → **Cut Cross-Entropy**
-- **New**: Applied to Harmonic loss → **Cut HarMax**
-
-Both implementations share the same core innovation: avoiding materialization of the full (batch_size, vocab_size) matrix through fused kernel computation and block-wise processing.
-
-## Acknowledgments
-
-This implementation builds upon the excellent work of the original CCE (Cut Cross-Entropy) authors, adapting their innovative "Cut" technique to the harmonic loss domain.
+1. **Performance Optimization**: Further tuning for specific hardware
+2. **Adaptive Min-P**: Dynamic threshold selection based on text quality
+3. **Hybrid Approaches**: Combining HarMax with other distance metrics
+4. **Integration**: Compatibility with popular ML frameworks
+5. **Adaptive Temperature**: Dynamic temperature adjustment during generation
