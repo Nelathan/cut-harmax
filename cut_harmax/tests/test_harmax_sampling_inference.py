@@ -14,7 +14,7 @@ def _create_test_data():
 
     # Create test weight matrix
     c = torch.randn(vocab_size, embed_dim, dtype=torch.bfloat16)
-    e = torch.randn(embed_dim, dtype=torch.bfloat16)
+    e = torch.randn(1, embed_dim, dtype=torch.bfloat16)  # (1, embed_dim) for batch processing
 
     return e, c
 
@@ -25,20 +25,21 @@ def test_min_p_sampling():
 
     # Test basic sampling
     token = harmax_sample(e, c, min_p=0.01)
-    assert isinstance(token, int), f"Expected int, got {type(token)}"
-    assert 0 <= token < c.size(0), f"Token {token} out of range [0, {c.size(0)})"
+    assert isinstance(token, torch.Tensor), f"Expected tensor, got {type(token)}"
+    assert token.shape == (1,), f"Expected shape (1,), got {token.shape}"
+    assert 0 <= token.item() < c.size(0), f"Token {token.item()} out of range [0, {c.size(0)})"
 
     # Test with temperature
     token_high_temp = harmax_sample(e, c, temperature=2.0, min_p=0.01)
     token_low_temp = harmax_sample(e, c, temperature=0.5, min_p=0.01)
-    assert isinstance(token_high_temp, int)
-    assert isinstance(token_low_temp, int)
+    assert isinstance(token_high_temp, torch.Tensor)
+    assert isinstance(token_low_temp, torch.Tensor)
 
     # Test with different min_p thresholds
     token_strict = harmax_sample(e, c, min_p=0.1)  # 10% threshold
     token_permissive = harmax_sample(e, c, min_p=0.001)  # 0.1% threshold
-    assert isinstance(token_strict, int)
-    assert isinstance(token_permissive, int)
+    assert isinstance(token_strict, torch.Tensor)
+    assert isinstance(token_permissive, torch.Tensor)
 
     print("✓ Min-p sampling tests passed")
 
